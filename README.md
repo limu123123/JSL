@@ -4,7 +4,7 @@
 
 ## 在线游玩
 
-部署在 GitHub Pages 上：`https://limu123123.github.io/LLMRPG/`
+部署在 GitHub Pages 上：`https://limu123123.github.io/JSL/`
 
 ## 本地运行
 
