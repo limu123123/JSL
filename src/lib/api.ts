@@ -100,6 +100,85 @@ export function onTokenUsageRecorded(cb: () => void): () => void {
   };
 }
 
+// ==================== API 通信记录（进度 31，用户 2026-11-01 批准）====================
+// 纯只读观测：记录"最近一次"内容型请求的原始请求体与对应回传原文。仅存内存（不写 localStorage，刷新即清空）。
+// 观察者模式：只在 fetch 前后旁路摘录字符串，发送给 AI 的任何字节都与没有本功能时逐字节一致（含失败请求）。
+// 不记录 Authorization header / API Key（请求头不像请求体一样被摘录）。
+// models 列表类请求（连接检测/模型目录 GET）不带游戏内容，不入镜。
+export interface ApiTranscriptEntry {
+  ts: number; // 请求发出时刻
+  kind: string; // 内容类型：回合生成/开局协商/六维重设计/编年史压缩
+  engine: string; // deepseek / openai / gemini
+  endpoint: string;
+  method: string;
+  model: string;
+  request: string; // 本次上传给 API 的完整请求体（原样字符串，与 fetch body 逐字节一致）
+  response: string; // 最近回传原文（流式=各帧拼接后的完整文本；HTTP 失败=错误详情；进行中=空串）
+  ok: boolean; // HTTP 是否成功
+  done: boolean; // 回传是否已收完
+  durationMs: number;
+  note?: string; // 特殊说明（如 Gemini 走官方 SDK 无原始报文，为组装参数快照）
+}
+
+let lastApiTranscript: ApiTranscriptEntry | null = null;
+const apiTranscriptListeners: Array<() => void> = [];
+
+export function getLastApiTranscript(): ApiTranscriptEntry | null {
+  return lastApiTranscript;
+}
+
+export function onApiTranscriptUpdated(cb: () => void): () => void {
+  apiTranscriptListeners.push(cb);
+  return () => {
+    const idx = apiTranscriptListeners.indexOf(cb);
+    if (idx >= 0) apiTranscriptListeners.splice(idx, 1);
+  };
+}
+
+function notifyApiTranscript(): void {
+  for (const cb of [...apiTranscriptListeners]) {
+    try {
+      cb();
+    } catch {
+      // UI 监听器异常不得影响请求本体
+    }
+  }
+}
+
+// 请求发出前调用：建立新条目（上一条被覆盖——面板"只看当次"）
+function beginApiTranscript(entry: {
+  kind: string;
+  engine: string;
+  endpoint: string;
+  method: string;
+  model: string;
+  request: string;
+  note?: string;
+}): void {
+  lastApiTranscript = {
+    ...entry,
+    ts: Date.now(),
+    response: "",
+    ok: false,
+    done: false,
+    durationMs: 0,
+  };
+  notifyApiTranscript();
+}
+
+// 回传收完后调用（流式=各帧拼接后全文；HTTP 失败=错误详情）
+function completeApiTranscript(response: string, ok: boolean): void {
+  if (!lastApiTranscript) return;
+  lastApiTranscript = {
+    ...lastApiTranscript,
+    response,
+    ok,
+    done: true,
+    durationMs: Date.now() - lastApiTranscript.ts,
+  };
+  notifyApiTranscript();
+}
+
 export async function redesignAttributesAPI(payload: {
   genre: string;
   direction?: string;
@@ -162,6 +241,8 @@ export async function redesignAttributesAPI(payload: {
       apiKey: config.deepseekApiKey,
       apiUrl: config.deepseekApiUrl,
       model: config.deepseekModel,
+      engine: "deepseek",
+      kind: "六维重设计",
     });
     return res?.attributes?.length === 6 ? res.attributes : DEFAULT_ATTRIBUTE_DEFINITIONS;
   } else if (config.modelEngine === "openai") {
@@ -172,12 +253,15 @@ export async function redesignAttributesAPI(payload: {
       apiKey: config.openaiApiKey,
       apiUrl: config.openaiApiUrl,
       model: config.openaiModel,
+      engine: "openai",
+      kind: "六维重设计",
     });
     return res?.attributes?.length === 6 ? res.attributes : DEFAULT_ATTRIBUTE_DEFINITIONS;
   } else {
     const response = await generateContentWithFallback({
       contents: prompt,
       systemInstruction,
+      kind: "六维重设计",
       apiKey: config.geminiApiKey,
       responseSchema: {
         type: Type.OBJECT,
@@ -218,6 +302,8 @@ async function generateContentWithDeepSeek(config: {
   apiKey: string;
   apiUrl: string;
   model: string;
+  engine?: string; // 通信记录标签（不影响请求）
+  kind?: string; // 通信记录标签（不影响请求）
 }) {
   const cleanUrl = config.apiUrl.trim().replace(/\/$/, "");
   const endpoint = `${cleanUrl}/chat/completions`;
@@ -233,31 +319,46 @@ async function generateContentWithDeepSeek(config: {
     `[DeepSeek AI] Routing request to: ${endpoint} | Model: ${config.model}`,
   );
 
+  // 通信记录（进度 31，纯只读）：原样摘录请求体——fetch 的 body 与无本功能时逐字节一致
+  const requestBodyJson = JSON.stringify({
+    model: config.model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: finalContents },
+    ],
+    response_format: { type: "json_object" },
+    temperature: 0.7,
+  });
+  beginApiTranscript({
+    kind: config.kind || "内容请求",
+    engine: config.engine || "deepseek",
+    endpoint,
+    method: "POST",
+    model: config.model,
+    request: requestBodyJson,
+  });
   const response = await fetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${config.apiKey.trim()}`,
     },
-    body: JSON.stringify({
-      model: config.model,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: finalContents },
-      ],
-      response_format: { type: "json_object" },
-      temperature: 0.7,
-    }),
+    body: requestBodyJson,
   });
 
   if (!response.ok) {
     const errBody = await response.text();
+    completeApiTranscript(errBody, false); // 通信记录：HTTP 失败详情也上镜
     throw new Error(
       `DeepSeek API 请求失败 (HTTP ${response.status}): ${errBody || "未返回详情"}`,
     );
   }
 
-  const result: any = await response.json();
+  // 通信记录：改拿原文（text）再解析，回传原文可原样上镜（与 json() 语义等价）
+  const rawResponseText = await response.text();
+  completeApiTranscript(rawResponseText, true);
+
+  const result: any = JSON.parse(rawResponseText);
   if (result?.usage) recordTokenUsage("deepseek", result.model || config.model, result.usage);
   const content = result?.choices?.[0]?.message?.content || "";
 
@@ -353,6 +454,7 @@ async function generateContentWithDeepSeekStream(config: {
   apiKey: string;
   apiUrl: string;
   model: string;
+  engine?: string; // 通信记录标签（不影响请求）
   onProgress?: (partialJson: string) => void;
 }) {
   const cleanUrl = config.apiUrl.trim().replace(/\/$/, "");
@@ -394,17 +496,28 @@ async function generateContentWithDeepSeekStream(config: {
     }
   }
 
+  // 通信记录（进度 31，纯只读）：回合生成请求是核心观测对象——body 原样上镜，逐字节与历史一致
+  const requestBodyJson = JSON.stringify(requestBody);
+  beginApiTranscript({
+    kind: "回合生成",
+    engine: config.engine || "deepseek",
+    endpoint,
+    method: "POST",
+    model: config.model,
+    request: requestBodyJson,
+  });
   const response = await fetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${config.apiKey.trim()}`,
     },
-    body: JSON.stringify(requestBody),
+    body: requestBodyJson,
   });
 
   if (!response.ok) {
     const errBody = await response.text();
+    completeApiTranscript(errBody, false); // 通信记录：HTTP 失败详情也上镜
     throw new Error(
       `DeepSeek API 请求失败 (HTTP ${response.status}): ${errBody || "未返回详情"}`,
     );
@@ -412,7 +525,10 @@ async function generateContentWithDeepSeekStream(config: {
 
   if (!response.body) {
     // Some gateways do not support streaming; fall back to waiting for the full result
-    const result: any = await response.json();
+    // 通信记录：改拿原文（text）再解析，与 json() 语义等价
+    const rawResponseText = await response.text();
+    completeApiTranscript(rawResponseText, true);
+    const result: any = JSON.parse(rawResponseText);
     if (result?.usage) recordTokenUsage("deepseek", result.model || config.model, result.usage);
     const content = result?.choices?.[0]?.message?.content || "";
     const cleaned = stripThinkTags(content)
@@ -464,6 +580,8 @@ async function generateContentWithDeepSeekStream(config: {
   config.onProgress?.(full);
   // 流收尾：整条请求只入账一次
   if (lastUsage) recordTokenUsage("deepseek", lastModel || config.model, lastUsage);
+  // 通信记录：回传原文 = 各帧 delta 拼接后的完整文本（思维链帧本应用本就不解析不受影响）
+  completeApiTranscript(full, true);
 
   const content = full.trim();
   // Strip reasoning packages if present, then markdown code fences
@@ -489,6 +607,7 @@ async function generateContentWithFallback(config: {
   systemInstruction: string;
   responseSchema: any;
   apiKey: string;
+  kind?: string; // 通信记录标签（不影响请求）
 }) {
   const ai = new GoogleGenAI({ apiKey: config.apiKey });
 
@@ -502,6 +621,22 @@ async function generateContentWithFallback(config: {
         console.log(
           `[TRPG AI] Attempting with model: ${model} (attempt ${attempt}/2)`,
         );
+        // 通信记录（进度 31）：Gemini 走官方 SDK，无原始 HTTP 报文——记录组装参数快照（近似请求）。
+        // 每次尝试建立一条（失败换模型时面板显示的是最后一次尝试），字节零影响。
+        beginApiTranscript({
+          kind: config.kind || "Gemini 请求",
+          engine: "gemini",
+          endpoint: "GoogleGenAI SDK（generativelanguage.googleapis.com）",
+          method: "POST",
+          model,
+          request: JSON.stringify({
+            model,
+            contents: config.contents,
+            systemInstruction: config.systemInstruction,
+            responseSchema: config.responseSchema,
+          }),
+          note: "Gemini 走官方 SDK，无原始 HTTP 报文；此为组装参数快照（近似请求）",
+        });
         const response = await ai.models.generateContent({
           model: model,
           contents: config.contents,
@@ -514,10 +649,12 @@ async function generateContentWithFallback(config: {
 
         if (response && response.text) {
           if (response.usageMetadata) recordTokenUsage("gemini", model, response.usageMetadata);
+          completeApiTranscript(response.text || "", true);
           return response;
         }
       } catch (err: any) {
         lastError = err;
+        completeApiTranscript(String(err?.message || err) || "Gemini SDK 调用失败", false);
         console.error(`[TRPG AI] Model ${model} failed:`, err.message || err);
         // Sleep briefly before retrying
         await new Promise((resolve) => setTimeout(resolve, 600));
@@ -661,6 +798,8 @@ export async function negotiateCharacterAPI(
       apiKey: config.deepseekApiKey,
       apiUrl: config.deepseekApiUrl,
       model: config.deepseekModel,
+      engine: "deepseek",
+      kind: "开局协商",
     });
   } else if (config.modelEngine === "openai") {
     // We can reuse the DeepSeek client logic since OpenAI's API is identical
@@ -671,11 +810,14 @@ export async function negotiateCharacterAPI(
       apiKey: config.openaiApiKey,
       apiUrl: config.openaiApiUrl,
       model: config.openaiModel,
+      engine: "openai",
+      kind: "开局协商",
     });
   } else {
     const response = await generateContentWithFallback({
       contents: prompt,
       systemInstruction,
+      kind: "开局协商",
       apiKey: config.geminiApiKey,
       responseSchema: {
         type: Type.OBJECT,
@@ -759,67 +901,111 @@ ${turnsText}
 请为这 20 个回合撰写一气呵成的故事编年史阶段总结。`;
 
   if (config.modelEngine === "deepseek") {
+    // 通信记录（进度 31，纯只读）：原样摘录请求体，body 与无本功能时逐字节一致
+    const compressEndpoint = `${config.deepseekApiUrl.trim().replace(/\/$/, "")}/chat/completions`;
+    const compressBodyJson = JSON.stringify({
+      model: config.deepseekModel,
+      messages: [
+        { role: "system", content: systemInstruction },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.6,
+    });
+    beginApiTranscript({
+      kind: "编年史压缩",
+      engine: "deepseek",
+      endpoint: compressEndpoint,
+      method: "POST",
+      model: config.deepseekModel,
+      request: compressBodyJson,
+    });
     const response = await fetch(
-      `${config.deepseekApiUrl.trim().replace(/\/$/, "")}/chat/completions`,
+      compressEndpoint,
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${config.deepseekApiKey}`,
         },
-        body: JSON.stringify({
-          model: config.deepseekModel,
-          messages: [
-            { role: "system", content: systemInstruction },
-            { role: "user", content: prompt },
-          ],
-          temperature: 0.6,
-        }),
+        body: compressBodyJson,
       },
     );
 
     if (!response.ok) {
       const errBody = await response.text();
+      completeApiTranscript(errBody, false);
       throw new Error(
         `DeepSeek API 请求失败 (HTTP ${response.status}): ${errBody}`,
       );
     }
-    const result: any = await response.json();
+    // 通信记录：拿原文（text）再解析，与 json() 语义等价
+    const rawResponseText = await response.text();
+    completeApiTranscript(rawResponseText, true);
+    const result: any = JSON.parse(rawResponseText);
     if (result?.usage) recordTokenUsage("deepseek", result.model || config.deepseekModel, result.usage);
     const content = result?.choices?.[0]?.message?.content || "";
     return { summary: content.trim() };
   } else if (config.modelEngine === "openai") {
+    // 通信记录（进度 31，纯只读）：原样摘录请求体
+    const compressEndpoint2 = `${config.openaiApiUrl.trim().replace(/\/$/, "")}/chat/completions`;
+    const compressBodyJson2 = JSON.stringify({
+      model: config.openaiModel,
+      messages: [
+        { role: "system", content: systemInstruction },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.6,
+    });
+    beginApiTranscript({
+      kind: "编年史压缩",
+      engine: "openai",
+      endpoint: compressEndpoint2,
+      method: "POST",
+      model: config.openaiModel,
+      request: compressBodyJson2,
+    });
     const response = await fetch(
-      `${config.openaiApiUrl.trim().replace(/\/$/, "")}/chat/completions`,
+      compressEndpoint2,
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${config.openaiApiKey}`,
         },
-        body: JSON.stringify({
-          model: config.openaiModel,
-          messages: [
-            { role: "system", content: systemInstruction },
-            { role: "user", content: prompt },
-          ],
-          temperature: 0.6,
-        }),
+        body: compressBodyJson2,
       },
     );
 
     if (!response.ok) {
       const errBody = await response.text();
+      completeApiTranscript(errBody, false);
       throw new Error(
         `OpenAI API 请求失败 (HTTP ${response.status}): ${errBody}`,
       );
     }
-    const result: any = await response.json();
+    const rawResponseText = await response.text();
+    completeApiTranscript(rawResponseText, true);
+    const result: any = JSON.parse(rawResponseText);
     if (result?.usage) recordTokenUsage("deepseek", result.model || config.openaiModel, result.usage);
     const content = result?.choices?.[0]?.message?.content || "";
     return { summary: content.trim() };
   } else {
     const ai = new GoogleGenAI({ apiKey: config.geminiApiKey });
+    // 通信记录（进度 31，纯只读）：Gemini SDK 无原始报文，记录组装参数快照（近似请求）
+    beginApiTranscript({
+      kind: "编年史压缩",
+      engine: "gemini",
+      endpoint: "GoogleGenAI SDK（generativelanguage.googleapis.com）",
+      method: "POST",
+      model: "gemini-2.5-flash",
+      request: JSON.stringify({
+        model: "gemini-2.5-flash",
+        contents: prompt,
+        systemInstruction,
+        temperature: 0.6,
+      }),
+      note: "Gemini 走官方 SDK，无原始 HTTP 报文；此为组装参数快照（近似请求）",
+    });
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash",
       contents: prompt,
@@ -828,6 +1014,7 @@ ${turnsText}
         temperature: 0.6,
       },
     });
+    completeApiTranscript(String(response?.text || ""), true);
 
     return { summary: response.text?.trim() || "" };
   }
@@ -848,6 +1035,7 @@ export async function generateEventAPI(
     gmPersonality,
     guidancePrompt,
     pinnedMemo,
+    turnDirective,
   } = payload;
 
   if (config.modelEngine === "gemini" && !config.geminiApiKey) {
@@ -896,7 +1084,7 @@ export async function generateEventAPI(
 你负责为玩家撰写精彩、动态、高响应性的剧情，并生成推荐选择。
 
 核心规则：
-1. 【高反馈度】：必须完全契合玩家选择或输入的行动（"${choiceOrAction}"）。如果玩家掷骰了（diceRoll），你必须将掷骰结果（例如：${diceRoll ? `总检定值为 ${diceRoll.total}（掷骰 ${diceRoll.rollValue} + 修正 ${diceRoll.modifier}），难度DC为 ${diceRoll.targetDc}，判定为 ${diceRoll.isSuccess ? "成功" : "失败"}` : "无骰点"}）写进故事的发展里！
+1. 【高反馈度】：必须完全契合玩家选择或输入的行动（具体行动文字、是否掷骰与骰点详情，一律以本轮上下文中的【当前玩家的最新行动】区段为准）。如果该区段附有【骰点结果反馈】，你必须将该结果（最终检定总和、目标难度DC、成功/失败判定）完整写进故事的发展里！
    - 骰点成功：玩家帅气、精彩地达成了目的，或者获得了意料之外的好处。
    - 骰点失败：玩家遭遇挫折、陷入窘境、受伤、失去物品，或引发了更复杂的矛盾，但游戏绝不能在此戛然而止，必须有新的危机引导他们前进。
 2. 【属性与资源】：根据剧情发展，玩家的生命值(HP)、理智/资源值(Sanity)应当有动态增减，但不要直接让角色死亡，除非玩家生命归零（归零则判定为游戏结束，并给出相应的悲壮结局）。
@@ -959,7 +1147,14 @@ ${h.rollResult ? `判定结果: ${h.rollResult}` : ""}`;
     typeof pinnedMemo === "string" && pinnedMemo.trim()
       ? `【玩家钉住的备忘（全档常驻——此内容不随历史压缩、近史窗口移动或时光回溯而消失，你必须在每一回合叙事前回顾并遵守如下要求）】\n"${pinnedMemo.trim()}"\n`
       : "";
-  const actionContext = `${memoBlock}【当前玩家的最新行动】
+  // 回合额外指令（2026-11-02 用户批准，例外区块 11）：行动框下方"额外要求"输入的内容，
+  // 随每个回合请求上送（随存档持久化），直到玩家手动清除；空 = 不注入 = 请求逐字节同现状。
+  // 语义与钉住备忘互补：memo=全档常驻定位，这条=当前着重执行的具体要求（如侧重描写某方面）。
+  const directiveBlock =
+    typeof turnDirective === "string" && turnDirective.trim()
+      ? `【玩家的当前额外要求（持续生效——请在本回合及后续回合的叙事中重点执行此要求，若为侧重描写的嘱咐，请显著加重该方面的笔墨密度；此内容随每回合请求携带，不随历史压缩或时光回溯消失，直至玩家手动删除）】\n"${turnDirective.trim()}"\n`
+      : "";
+  const actionContext = `${memoBlock}${directiveBlock}【当前玩家的最新行动】
 行动: "${choiceOrAction}"
 ${
   diceRoll
@@ -1076,6 +1271,7 @@ ${guidancePrompt ? `\n【玩家对本回合故事走向的期望/提示词（请
       apiKey: config.deepseekApiKey,
       apiUrl: config.deepseekApiUrl,
       model: config.deepseekModel,
+      engine: "deepseek",
       onProgress: (partialJson) => {
         const partial = extractPartialStoryText(partialJson);
         if (partial) onStoryProgress?.(partial);
@@ -1089,6 +1285,7 @@ ${guidancePrompt ? `\n【玩家对本回合故事走向的期望/提示词（请
       apiKey: config.openaiApiKey,
       apiUrl: config.openaiApiUrl,
       model: config.openaiModel,
+      engine: "openai",
       onProgress: (partialJson) => {
         const partial = extractPartialStoryText(partialJson);
         if (partial) onStoryProgress?.(partial);
@@ -1098,6 +1295,7 @@ ${guidancePrompt ? `\n【玩家对本回合故事走向的期望/提示词（请
     const response = await generateContentWithFallback({
       contents: prompt,
       systemInstruction,
+      kind: "回合生成",
       apiKey: config.geminiApiKey,
       responseSchema: {
         type: Type.OBJECT,

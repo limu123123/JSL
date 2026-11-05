@@ -18,7 +18,11 @@ import {
   getTokenUsageLog,
   clearTokenUsageLog,
   onTokenUsageRecorded,
+  getLastApiTranscript,
+  onApiTranscriptUpdated,
+  ApiTranscriptEntry,
 } from "../lib/api";
+import { copyTextToClipboard } from "../lib/clipboard";
 import { evaluateTraitBonus, TraitEvaluationResult } from "../lib/traitBonus";
 import {
   deleteSlotSaveTxt,
@@ -165,6 +169,7 @@ interface GameScreenProps {
   initialTurnSnapshots?: TurnSnapshot[];
   initialFullStoryArchive?: HistoryTurn[];
   initialPinnedMemo?: string;
+  initialTurnDirective?: string;
   onExit: () => void;
   onChangePersonality?: (pers: string) => void;
   onChangeWorldview?: () => void;
@@ -183,6 +188,7 @@ export default function GameScreen({
   initialTurnSnapshots = [],
   initialFullStoryArchive = [],
   initialPinnedMemo = "",
+  initialTurnDirective = "",
   onExit,
   onChangePersonality,
   onChangeWorldview,
@@ -224,6 +230,8 @@ export default function GameScreen({
   // 玩家钉住备忘（可选常驻便签；空=不上送；随自动/手动存档持久化，回溯/重掷不回收）
   const [pinnedMemo, setPinnedMemo] = useState<string>(initialPinnedMemo ?? "");
   const [showPinnedMemoModal, setShowPinnedMemoModal] = useState(false);
+  // 回合额外指令（2026-11-02 用户批准：行动框下方"额外要求"，随每回合请求上送，保留到手动清除）
+  const [turnDirective, setTurnDirective] = useState<string>(initialTurnDirective ?? "");
 
   // States to facilitate paragraph regeneration
   const [lastActionText, setLastActionText] = useState<string>(
@@ -295,6 +303,27 @@ export default function GameScreen({
   const [tokenUsage, setTokenUsage] = useState(() => summarizeTokenUsage());
   // 每次请求完成后（api.ts 埋点触发）自动刷新账单显示
   useEffect(() => onTokenUsageRecorded(() => setTokenUsage(summarizeTokenUsage())), []);
+  // API 通信记录（2026-11-01 对齐批，进度 31，纯只读）：最近一次请求的「上传请求体」+「回传原文」快照。
+  // 仅内存、刷新即清空；api.ts 埋点（请求发出/回传完成/失败）实时触发刷新。
+  const [showApiTranscriptModal, setShowApiTranscriptModal] = useState(false);
+  const [apiTranscriptTab, setApiTranscriptTab] = useState<"request" | "response">("request");
+  const [apiTranscript, setApiTranscript] = useState<ApiTranscriptEntry | null>(() => getLastApiTranscript());
+  useEffect(() => onApiTranscriptUpdated(() => setApiTranscript(getLastApiTranscript())), []);
+  const handleCopyApiTranscript = async () => {
+    const t = getLastApiTranscript();
+    if (!t) return;
+    const text = apiTranscriptTab === "request" ? t.request : t.done ? t.response : "";
+    if (!text) return;
+    const okCopy = await copyTextToClipboard(text);
+    setSaveStatus(
+      okCopy
+        ? apiTranscriptTab === "request"
+          ? "已复制请求体到剪贴板"
+          : "已复制回传原文到剪贴板"
+        : "复制失败（浏览器安全限制），请手动选中内容",
+    );
+    setTimeout(() => setSaveStatus(""), 2500);
+  };
   // 特质动态演化开关（默认关闭；存 trpg_api_config.traitEvolution）
   const [traitEvolution, setTraitEvolution] = useState<boolean>(() => {
     try {
@@ -738,6 +767,7 @@ export default function GameScreen({
       turnSnapshots,
       fullStoryArchive,
       pinnedMemo,
+      turnDirective,
     };
     localStorage.setItem("trpg_autosave", JSON.stringify(saveState));
     // 静默同步写入 TXT 存档文件（文件名 = 存档名称；未授权文件夹时自动跳过）
@@ -758,6 +788,7 @@ export default function GameScreen({
     turnSnapshots,
     fullStoryArchive,
     pinnedMemo,
+    turnDirective,
   ]);
 
   // 载入/开局时为当前回合补一条基线快照（此后每回合结算自动追加）——让刚打开的旧档也能"回到本回合"
@@ -808,6 +839,7 @@ export default function GameScreen({
         turnSnapshots,
         fullStoryArchive,
         pinnedMemo,
+        turnDirective,
         saveName: saveSlots?.[slotIndex]?.saveName,
         saveDate: new Date().toLocaleString(),
       };
@@ -874,6 +906,7 @@ export default function GameScreen({
         gmPersonality: activeGmPersonality,
         guidancePrompt,
         pinnedMemo,
+        turnDirective,
       };
 
       const data = await generateEventAPI(
@@ -902,7 +935,8 @@ export default function GameScreen({
       // 进背囊前整理（2026-10-28）：① added 先去空串再做跨档去重（AI 重复/空名不再入库）
       // ② removed 由"全名精确匹配"升级为"双向包含模糊匹配"，容耐 AI 措辞漂移
       //    （例：AI 说"丢弃锈蚀的长剑"→ 能命中背囊里的"长剑"；完全找不到的静默忽略，不误伤）
-      let updatedInventory = [...character.inventory];
+      // 读档/回包防御（进度 32）：旧档缺 inventory 字段时不再裸崩（候选白屏根因之一）
+      let updatedInventory = [...(Array.isArray(character.inventory) ? character.inventory : [])];
 
       // 兜底：物品演化开关关闭时（提示词/schema 已不含物品变动指令），忽略 AI 返回的任何物品变动
       if (data.inventoryChanges && getApiConfig().inventoryEvolution !== false) {
@@ -933,10 +967,17 @@ export default function GameScreen({
 
       // Process dynamic trait evolution from story
       // 兜底：特质演化开关关闭时（提示词/schema 已不含该指令），忽略 AI 返回的任何特质变动
-      let updatedTraits = [...character.traits];
+      // 读档/回包防御（进度 32）：旧档缺 traits 字段不再裸崩
+      let updatedTraits = [...(Array.isArray(character.traits) ? character.traits : [])];
       if (data.traitChanges && getApiConfig().traitEvolution === true) {
-        const added = data.traitChanges.added || [];
-        const removed = data.traitChanges.removed || [];
+        // 回包防御（进度 32）：AI 违反 schema 返回非字符串/缺失数组时，转字符串+过滤，
+        // 避免特质 chip/评估管线（traitBonus）拿到对象 trailed 崩渲染
+        const added = (Array.isArray(data.traitChanges.added) ? data.traitChanges.added : [])
+          .map((t: any) => String(t ?? "").trim())
+          .filter((t: string) => t);
+        const removed = (Array.isArray(data.traitChanges.removed) ? data.traitChanges.removed : [])
+          .map((t: any) => String(t ?? "").trim())
+          .filter((t: string) => t);
         if (added.length > 0) {
           added.forEach((t: string) => {
             if (!updatedTraits.includes(t)) {
@@ -987,9 +1028,14 @@ export default function GameScreen({
       const nextHistory = [...activeHistory, newHistoryTurn];
       setHistory(nextHistory);
       setCharacter(updatedCharacter);
-      setCurrentEventText(data.storyText);
-      setCurrentGmCommentary(data.gmCommentary);
-      setCurrentChoices(data.recommendedChoices);
+      // 回包防御（进度 32）：AI 漏字段时兜底空值——避免后续渲染（Markdown/选项 chips/骰区）裸崩成白屏
+      setCurrentEventText(typeof data.storyText === "string" ? data.storyText : "");
+      setCurrentGmCommentary(typeof data.gmCommentary === "string" ? data.gmCommentary : "");
+      setCurrentChoices(
+        Array.isArray(data.recommendedChoices)
+          ? data.recommendedChoices.filter((c: any) => c && typeof c === "object")
+          : [],
+      );
       const nextIsGameOver = data.isGameOver || updatedCharacter.hp <= 0;
       const nextGameEndingType =
         updatedCharacter.hp <= 0 ? "death" : data.gameEndingType;
@@ -1592,6 +1638,14 @@ export default function GameScreen({
             {tokenUsage.n > 0
               ? `⚡ ${fmtTokenCount(tokenUsage.total)} · ${fmtTokenMoney(calcTokenCost(tokenUsage.prompt, tokenUsage.completion, tokenUsage.cacheHit))}`
               : "Token 账单"}
+          </button>
+          <button
+            onClick={() => setShowApiTranscriptModal(true)}
+            className="p-2 text-xs bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 rounded-lg hover:bg-amber-500 hover:text-zinc-900 transition-all flex items-center gap-1.5 font-semibold cursor-pointer"
+            title="API 通信记录：查看最近一次实际发给 AI 的完整请求体与 AI 回传的原文（含失败请求详情）。纯只读观测快照，不改变发给 AI 的任何内容；仅存内存，刷新页面即清空。"
+          >
+            <Scroll className="w-4 h-4 text-amber-600" />
+            通信记录
           </button>
           <label
             className="p-2 text-xs bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 rounded-lg flex items-center gap-1.5 font-semibold cursor-pointer"
@@ -3300,6 +3354,41 @@ export default function GameScreen({
                       AI
                       主持人，由其根据角色的智力/敏捷等属性及逻辑进行剧情后果叙述。
                     </p>
+
+                    {/* 回合额外指令（2026-11-02 用户批准上送变更，例外区块 11）：填写后随每个回合
+                        请求上送 AI（随存档持久化），保留到手动清除；空 = 不注入 = 请求逐字节同现状。
+                        与「📌 钉住备忘」（全档常驻定位）互补：这里放"当前着重执行"的具体嘱咐。 */}
+                    <div className="pt-1 space-y-1.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1">
+                          <Sparkles className="w-3 h-3 text-amber-500" />
+                          附加要求（发给 AI 主持人的持久嘱咐）
+                        </span>
+                        {turnDirective.trim() && (
+                          <button
+                            type="button"
+                            onClick={() => setTurnDirective("")}
+                            className="text-[10px] px-2 py-0.5 rounded-md bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:bg-red-50 dark:hover:bg-red-900/30 hover:text-red-500 transition-colors cursor-pointer flex items-center gap-0.5"
+                            title="清除要求：AI 从下一回合起不再见到此内容（本回合如已发出，不受影响）"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            清除
+                          </button>
+                        )}
+                      </div>
+                      <textarea
+                        rows={2}
+                        value={turnDirective}
+                        onChange={(e) =>
+                          setTurnDirective(e.target.value.slice(0, 300))
+                        }
+                        placeholder="例：着重描写环境氛围与光影细节 / 叙事带一点黑色幽默 / 侧重主角的心理活动……（空 = 不发送）"
+                        className="w-full text-xs p-2.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-950 text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-amber-500 resize-y"
+                      />
+                      <p className="text-[10px] text-amber-600 dark:text-amber-400/80 leading-normal">
+                        填写后随每个回合的请求持续发给 AI（保留到手动清除；刷新/换档不丢失，随自动与手动存档持久化）。
+                      </p>
+                    </div>
                   </div>
                 </>
               )}
@@ -3552,6 +3641,100 @@ export default function GameScreen({
                 className="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-xl text-xs font-bold transition-colors shadow-sm shadow-amber-500/10"
               >
                 保存并关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {showApiTranscriptModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-zinc-900 rounded-3xl max-w-3xl w-full p-6 shadow-2xl border border-zinc-200 dark:border-zinc-800 animate-fadeIn space-y-3 text-xs">
+            <h3 className="font-serif font-bold text-xl text-zinc-900 dark:text-zinc-100 flex items-center gap-2">
+              <Scroll className="w-5 h-5 text-amber-500" />
+              API 通信记录（最近一次）
+            </h3>
+            <p className="text-zinc-500 leading-relaxed">
+              纯只读观测快照：「本次上传内容」= 最近一次实际发给 AI 的完整请求体（逐字节原样）；「最近回传原文」= AI 回传的原始文本（流式为各帧拼接后的全文，失败请求记录错误详情）。<strong>不含 Authorization header / API Key</strong>。仅存内存，刷新页面即清空；下一次内容型请求（回合生成 / 开局协商 / 六维重设计 / 编年史压缩）发出的瞬间自动覆盖上一条。发给 AI 的请求与没有本功能时逐字节一致。
+            </p>
+            {!apiTranscript ? (
+              <div className="text-zinc-400 text-center py-8 border border-dashed border-zinc-200 dark:border-zinc-800 rounded-xl leading-relaxed">
+                还没有快照。
+                <br />
+                下一次内容型请求（回合生成 / 开局协商 / 六维重设计 / 编年史压缩）发出时会自动记录。
+              </div>
+            ) : (
+              <>
+                <div className="flex flex-wrap items-center gap-2 text-[11px] text-zinc-600 dark:text-zinc-300 bg-zinc-50 dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 rounded-xl px-3 py-2">
+                  <span className="font-bold text-amber-600">{apiTranscript.kind}</span>
+                  <span>· {apiTranscript.engine}</span>
+                  <span>· {apiTranscript.model || "（未知模型）"}</span>
+                  <span>· {new Date(apiTranscript.ts).toLocaleTimeString()}</span>
+                  <span>· {apiTranscript.done ? `耗时 ${(apiTranscript.durationMs / 1000).toFixed(1)}s` : "进行中…"}</span>
+                  {apiTranscript.done ? (
+                    apiTranscript.ok ? (
+                      <span className="ml-auto px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 font-bold">
+                        ✅ 已回传（{apiTranscript.response.length.toLocaleString()} 字符）
+                      </span>
+                    ) : (
+                      <span className="ml-auto px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 font-bold">
+                        ⛔ 请求失败
+                      </span>
+                    )
+                  ) : (
+                    <span className="ml-auto px-2 py-0.5 rounded-full bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 font-bold">
+                      ⏳ 等待回传
+                    </span>
+                  )}
+                </div>
+                {apiTranscript.note && (
+                  <p className="text-[10px] text-amber-600 dark:text-amber-400">※ {apiTranscript.note}</p>
+                )}
+                <div className="flex gap-1.5">
+                  <button
+                    onClick={() => setApiTranscriptTab("request")}
+                    className={`px-3 py-1.5 rounded-lg font-bold transition-colors cursor-pointer ${
+                      apiTranscriptTab === "request"
+                        ? "bg-amber-500 text-white"
+                        : "bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                    }`}
+                  >
+                    📤 本次上传内容
+                  </button>
+                  <button
+                    onClick={() => apiTranscript.done && setApiTranscriptTab("response")}
+                    disabled={!apiTranscript.done}
+                    className={`px-3 py-1.5 rounded-lg font-bold transition-colors ${
+                      apiTranscriptTab === "response"
+                        ? "bg-amber-500 text-white"
+                        : "bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                    } ${apiTranscript.done ? "cursor-pointer" : "opacity-50 cursor-not-allowed"}`}
+                  >
+                    📥 最近回传原文{!apiTranscript.done && "（等待中…）"}
+                  </button>
+                </div>
+                <pre className="whitespace-pre-wrap break-all bg-zinc-50 dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 rounded-xl p-3 font-mono text-[11px] leading-relaxed max-h-[55vh] overflow-auto">
+                  {apiTranscriptTab === "request"
+                    ? apiTranscript.request
+                    : apiTranscript.done
+                      ? apiTranscript.response || "（回传为空）"
+                      : "请求已发出，等待 AI 回传…收到后此处会自动填入原文。"}
+                </pre>
+                {apiTranscript && (
+                  <button
+                    onClick={handleCopyApiTranscript}
+                    className="w-fit px-4 py-2 bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-300 rounded-xl text-xs font-semibold transition-colors cursor-pointer"
+                  >
+                    📋 复制{apiTranscriptTab === "request" ? "请求体" : "回传原文"}
+                  </button>
+                )}
+              </>
+            )}
+            <div className="flex justify-end pt-2 border-t border-zinc-100 dark:border-zinc-800">
+              <button
+                onClick={() => setShowApiTranscriptModal(false)}
+                className="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-xl text-xs font-bold transition-colors shadow-sm shadow-amber-500/10 cursor-pointer"
+              >
+                关闭
               </button>
             </div>
           </div>

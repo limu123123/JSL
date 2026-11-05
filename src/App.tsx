@@ -98,6 +98,7 @@ export default function App() {
   const [activeTurnSnapshots, setActiveTurnSnapshots] = useState<TurnSnapshot[]>([]);
   const [activeFullStoryArchive, setActiveFullStoryArchive] = useState<HistoryTurn[]>([]);
   const [activePinnedMemo, setActivePinnedMemo] = useState<string>("");
+  const [activeTurnDirective, setActiveTurnDirective] = useState<string>("");
 
   // Archive Slots
   const [hasAutosave, setHasAutosave] = useState(false);
@@ -297,6 +298,7 @@ export default function App() {
       setActiveTurnSnapshots(savedState.turnSnapshots || []);
       setActiveFullStoryArchive(savedState.fullStoryArchive || []);
       setActivePinnedMemo(savedState.pinnedMemo || "");
+      setActiveTurnDirective(savedState.turnDirective || "");
 
       // Mimic an initial event format from current state
       setActiveInitialEvent({
@@ -331,6 +333,7 @@ export default function App() {
       setActiveTurnSnapshots(saveData.turnSnapshots || []);
       setActiveFullStoryArchive(saveData.fullStoryArchive || []);
       setActivePinnedMemo(saveData.pinnedMemo || "");
+      setActiveTurnDirective(saveData.turnDirective || "");
 
       setActiveInitialEvent({
         storyText: saveData.currentEventText,
@@ -391,6 +394,7 @@ export default function App() {
     setActiveTurnSnapshots([]);
     setActiveFullStoryArchive([]);
     setActivePinnedMemo("");
+    setActiveTurnDirective("");
     setCurrentScreen("game");
   };
 
@@ -1722,6 +1726,7 @@ export default function App() {
             initialTurnSnapshots={activeTurnSnapshots}
             initialFullStoryArchive={activeFullStoryArchive}
             initialPinnedMemo={activePinnedMemo}
+            initialTurnDirective={activeTurnDirective}
             onExit={() => setCurrentScreen("home")}
             onChangePersonality={(pers) => {
               setActivePersonality(pers);
